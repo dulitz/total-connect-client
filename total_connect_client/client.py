@@ -12,10 +12,7 @@ import logging
 import time
 import warnings
 
-import zeep
-import zeep.cache
-import zeep.transports
-import requests.exceptions
+import requests
 
 from .const import ArmType
 from .exceptions import (
@@ -53,8 +50,7 @@ class TotalConnectClient:
     AUTHENTICATION_FAILED = -100
     FEATURE_NOT_SUPPORTED = -120
 
-    MAX_RETRY_ATTEMPTS = 10
-    TIMEOUT = 60  # seconds until SOAP I/O will fail
+    TIMEOUT = 60  # seconds until HTTP request will fail
 
     def __init__(
         self,
@@ -67,9 +63,6 @@ class TotalConnectClient:
         """Initialize."""
         self.times = {}
         self.time_start = time.time()
-        self.soap_client = None
-        self.application_id = "14588"
-        self.application_version = "1.0.34"
 
         self.username = username
         self.password = password
@@ -143,7 +136,7 @@ class TotalConnectClient:
 
     def _raise_for_retry(self, response):
         """Used internally to determine which responses should be retried in
-        request().
+        _api_post().
         """
         rc = response["ResultCode"]
         if rc == self.INVALID_SESSION:
@@ -182,53 +175,45 @@ class TotalConnectClient:
             raise AuthenticationError("user code unavailable", response)
         raise BadResultCodeError(f"unknown result code {rc}", response)
 
-    def request(self, request, attempts=0):
-        """Send a SOAP request."""
-
-        if not self.soap_client:
-            transport = zeep.transports.Transport(
-                cache=zeep.cache.InMemoryCache(timeout=3600),
-                timeout=self.TIMEOUT,  # for loading WSDL and xsd documents
-                operation_timeout=self.TIMEOUT,  # for operations (POST/GET)
-            )
-            self.soap_client = zeep.Client(
-                "https://rs.alarmnet.com/TC21api/tc2.asmx?WSDL",
-                transport=transport
-            )
+    #API = "https://rs.alarmnet.com/TC21API/TC2.asmx"
+    API = "https://rs.alarmnet.com/TC21api/tc2.asmx"
+    API_APP_ID = "14588"
+    API_APP_VERSION = "1.0.34"
+    def _api_post(self, endpoint, postdata, retries=5):
         try:
-            LOGGER.debug(f"sending API request {request}")
-            r = eval("self.soap_client.service." + request)
-            response = zeep.helpers.serialize_object(r)
-            self._raise_for_retry(response)
-            return response
+            uri = f"{API}/{endpoint}"
+            LOGGER.debug(f"POST {uri} with {postdata}")
+            r = requests.post(uri, data=postdata, timeout=self.TIMEOUT)
+            self._raise_for_retry(r)
+            return r
         # To retry an exception that could be raised during the request,
         # add it to one of the following except blocks, depending on what
         # you want to have happen. The first two blocks are the same except
         # for what gets logged. The third block causes reauthentication.
         except requests.exceptions.RequestException as err:
-            if attempts > self.MAX_RETRY_ATTEMPTS:
+            if retries <= 0:
                 raise
-            LOGGER.info(f"retrying {err} on {self.username}, attempt # {attempts}")
+            LOGGER.info(f"retrying {err} on {self.username}, {retries} remaining")
             time.sleep(self.retry_delay)
-            return self.request(request, attempts + 1)
         except RetryableTotalConnectError as err:
-            if attempts > self.MAX_RETRY_ATTEMPTS:
+            if retries <= 0:
                 raise
-            LOGGER.info(f"retrying {err.args[0]} on {self.username}, attempt # {attempts}")
+            LOGGER.info(f"retrying {err.args[0]} on {self.username}, {retries} remaining")
             time.sleep(self.retry_delay)
-            return self.request(request, attempts + 1)
         except InvalidSessionError:
-            if attempts > self.MAX_RETRY_ATTEMPTS:
+            if retries <= 0:
                 raise
-            LOGGER.info(f"reauthenticating session for {self.username}, attempt # {attempts}")
+            LOGGER.info(f"reauthenticating session for {self.username}, {retries} remaining")
             self.token = None
             self.authenticate()
-            return self.request(request, attempts + 1)
+        return self._api_post(endpoint, postdata, retries - 1)
 
     def authenticate(self):
-        """Login to the system. Upon success, self.token is a valid credential
+        """Login to the system. Upon return, self.token is a valid credential
         for further API calls, and self._user and self.locations are valid.
         self.locations will not be refreshed if it was non-empty on entry.
+
+        Raises AuthenticationError if credentials are invalid.
         """
         start_time = time.time()
         if self._invalid_credentials:
@@ -240,10 +225,12 @@ class TotalConnectClient:
         verb = (
             "AuthenticateUserLogin" if self._locations else "LoginAndGetSessionDetails"
         )
-        response = self.request(
-            verb + "(self.username, self.password, "
-            "self.application_id, self.application_version)"
-        )
+        response = self._api_post(verb, {
+            "userName": self.username,
+            "password": self.password,
+            "ApplicationID": self.API_APP_ID,
+            "ApplicationVersion": self.API_APP_VERSION,
+        })
         try:
             self.raise_for_resultcode(response)
         except AuthenticationError:
@@ -266,9 +253,11 @@ class TotalConnectClient:
 
     def validate_usercode(self, device_id, usercode):
         """Return True if the usercode is valid for the device."""
-        response = self.request(
-            f"ValidateUserCode(self.token, {device_id}, '{usercode}')"
-        )
+        response = self._api_post("ValidateUserCode", {
+            "SessionID": self.token,
+            "DeviceID": device_id,
+            "UserCode": str(usercode),
+        })
 
         if response["ResultCode"] in (
             self.USER_CODE_INVALID,
@@ -288,7 +277,7 @@ class TotalConnectClient:
         still might be logged in.
         """
         if self.is_logged_in():
-            response = self.request("Logout(self.token)")
+            response = self._api_post("Logout", { "SessionID": self.token })
             self.raise_for_resultcode(response)
             LOGGER.info("Logout Successful")
             self.token = None

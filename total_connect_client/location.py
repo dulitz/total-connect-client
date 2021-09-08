@@ -103,9 +103,16 @@ class TotalConnectLocation:
     def get_panel_meta_data(self):
         """Get all meta data about the alarm panel."""
         # see https://rs.alarmnet.com/TC21api/tc2.asmx?op=GetPanelMetaDataAndFullStatus
-        result = self.parent.request(
-            f"GetPanelMetaDataAndFullStatusEx_V2(self.token, {self.location_id}, 0, 0, {self._partition_list})"
-        )
+        # V2 takes a list of integer PartitionIDs but is only available in SOAP
+        # V1 is available for HTTP POST but seems to take only a single (integer) PartitionID
+        result = self.parent._api_post("GetPanelMetaDataAndFullStatusEx_V1", {
+            "SessionID": self.token,
+            "LocationID": self.location_id,
+            "LastSequenceNumber": 0,
+            "LastUpdatedTimestampTicks": 0,
+            # FIXME FIXME FIXME
+            "PartitionID": self._partition_list[0],
+        })
         self.parent.raise_for_resultcode(result)
 
         self.set_status(result)
@@ -135,8 +142,14 @@ class TotalConnectLocation:
 
     def get_zone_details(self):
         """Get Zone details."""
-        result = self.parent.request(
-            f"GetZonesListInStateEx_V1(self.token, {self.location_id}, {self._partition_list}, 0)"
+        # GetZonesListInStateEx_V1 takes a list of partition IDs but
+        # is only available in SOAP
+        result = self.parent._api_post("GetZonesListInStateEx", {
+            "SessionID": self.token,
+            "LocationID": self.location_id,
+            # FIXME FIXME FIXME
+            "PartitionID": self._partition_list[0],
+            "ListIdentifierID": 0,
         )
 
         if result["ResultCode"] == self.parent.FEATURE_NOT_SUPPORTED:
